@@ -1,0 +1,23 @@
+%spark
+
+
+import java.util.ArrayList
+import java.lang
+
+// define a class for searching by SQL
+case class TrafficInfo(time:Long, rticid:String, avgspeed:Double, roadid:String)
+
+// load traffic data
+val trafficRDD = sc.textFile("/18Q3/2812/5ccfcbaf8f003718783aa07c/")
+                    .map(_.split(","))   // split information by comma
+                    .map(infos => TrafficInfo(infos(1).toLong, infos(0), infos(2).toDouble, infos(3)))
+                    
+// transform to dataform and register as a temptable
+trafficRDD.toDF().registerTempTable("spdata_chengdu")
+
+
+%sql
+select time,avgspeed
+from spdata_chengdu WHERE rticid=59566320561
+order by time
+
