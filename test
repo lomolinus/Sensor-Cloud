@@ -1,0 +1,250 @@
+%md
+<span style="font-size:14px">1. Data pre-processing<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;1.1 Load road condition data, map data and track data.<br></span>
+
+%spark
+ import cn.com.cennavi.minelab.cntf._
+ import java.util.ArrayList
+ import java.lang
+
+ val dataLoad = new DataLoad(sc)
+ val linktrafficdata = dataLoad.linkTrafficLoad("scp_lab_5","/MineData/DataHive/source/CNTF/110000/SP/*") //Load road condition data
+ val nilinkMap = dataLoad.getNILinkMap("scp_lab_1","/MineData/DataHive/source/MAP/110000/nilink/R-G.csv") //Load map data
+ val BasicTrajectoryRDD = dataLoad.getTrajectory("scp_lab_4","/MineData/DataHive/source/trajectory/110000/Speed_Profile/*") //Load track data
+ 
+ %md
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;1.2 Screen high-grade roads and make statistics of its road condition coverage.<br></span>
+
+%spark
+ //2. Data screening 
+ //(1) Screen road grade and calculate the average speed value per 5 minutes.
+ val dataselectRdd = linktrafficdata.map {
+     line =>  DataSelect.SelectCNTFKind(line)
+ }.filter { line => line!=null }.map {
+   line => 
+   val arr =line.split("_") 
+   (arr(0),arr(1))
+ }.reduceByKey((a,b)=>(a+","+b)).map{
+    line =>  UtilClassCompute.GetAvgValue(line._1, line._2)
+ }
+   //(2) Make statistics of road condition coverage.
+ val fiveminuteslinkNoRdd = dataselectRdd.map{
+   line => val arr = DataSelect.saveOfTime(line).split("_")
+   (arr(0),arr(1))
+ }.reduceByKey((a,b)=>(a+","+b)).map{
+   line => DataSelect.getStampLinkNums(line._1, line._2)
+ } 
+ 
+ case class LinkNum_5min(time:String, linkNum:Integer)
+ //Output the road condition coverage of each timestamp (per 5 minutes) - display.
+//  fiveminuteslinkNoRdd.collect().foreach { println }
+ val linkNum_5min = fiveminuteslinkNoRdd.map(s => s.split("_")).map(
+    s => LinkNum_5min(s(0),s(1).toInt)
+ ).toDF()
+ linkNum_5min.registerTempTable("linkNum_5min")
+
+
+%sql
+select time,linkNum
+from linkNum_5min
+order by time
+
+%md
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;1.3 Data pre-processing. Make statistics of data missing. For those serious, they should be deleted; for those not serious, they should be filled up.<br></span>
+
+%spark
+  //3. Data cleaning and filling
+    //(1) Based on the time sequence, put the speed value per hour of each link together into a line.
+ val dataseqRdd = dataselectRdd.map{
+   line =>val arr = DataProcess.saveOfHourHaveFiveMinutes(line).split("_")
+   (arr(0),arr(1))
+ }.groupByKey().map{
+   line => 
+   val it = line._2.iterator
+   val list = new ArrayList[String]()
+   while(it.hasNext){
+      list.add(it.next())
+    }
+   DataProcess.GetSpeedSeq(line._1, list)
+ }  
+    //(2) Make statistics of the number of link in time of missing the different number of timestamps for display. For instance, what's the number of link in time of missing 6 timestamps in 
+    //one hour (totally 12 timestamps). There are totally 4 ranges: less than 6, 6, 7-11, 12.
+ val defecttimestampintervallinkNoRdd = dataseqRdd.map(line => (DataProcess.getDefectTimeStampInterval(line),"1")).reduceByKey((a,b)=>(a+","+b)).map{
+   line =>UtilClassCompute.GetSumNo(line._1, line._2)
+ }
+    //Output the sample size of each missing range - display.
+    //defecttimestampintervallinkNoRdd.collect().foreach { println }
+ case class MissingIntervalRatio(rangeName:String, linkNum:Integer)
+ val missingIntervalRatio = defecttimestampintervallinkNoRdd.map(s => s.split("_")).map(
+    s => MissingIntervalRatio(
+    s(0),
+    s(1).toInt
+    )
+ ).toDF()
+    missingIntervalRatio.registerTempTable("missingIntervalRatio")
+    
+    //(3) Data deletion and filling (delete those less than 6).
+ val dataDelAndAddRdd = dataseqRdd.map{
+   line => DataProcess.dataDelAndAdd(line)
+ }.filter { line => line !=null }
+ 
+//   dataDelAndAddRdd.collect().foreach { println }
+
+%sql
+select rangeName, linkNum
+from missingIntervalRatio
+
+%md
+<span style="font-size:14px">2. Feature statistics<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;Calculate the average speed per hour of each link average per day for modeling.<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;Make statistics of the number of link of each speed range average per day.<br></span>
+
+%spark
+  /*
+ * II. Feature statistics
+ */
+    //1. Calculate the average speed of each link per hour per day.
+  val dayhouravgspeedRdd = dataDelAndAddRdd.map { 
+    line => UtilClassCompute.getDayHourSpeed(line)
+  }
+    //2. Calculate the average speed of each link per day.
+  val dayavgspeedRdd = dayhouravgspeedRdd.map{
+    line => val arr = DataProcess.saveOfDay(line).split("_")
+    (arr(0),arr(1))
+  }.reduceByKey((a,b)=>(a+","+b)).map{
+    line => UtilClassCompute.GetAvgValue(line._1, line._2)
+  }
+    //3. Calculate the average speed of each link average per day.
+  val avgdayavgspeedRdd = dayavgspeedRdd.map{
+    line => val arr = DataProcess.saveOfNoday(line).split("_")
+    ((arr(0),arr(1)))
+  }.reduceByKey((a,b)=>(a+","+b)).map{
+    line => UtilClassCompute.GetAvgValue(line._1, line._2)
+  }
+    //4. Calculate the number of link of different speed ranges/average per day.
+  val linkNoRdd = avgdayavgspeedRdd.map(line  => (UtilClassCompute.GetLinkInterval(line), "1")).reduceByKey((a,b)=>(a+","+b)).map{
+   line =>UtilClassCompute.GetSumNo(line._1, line._2)
+  }
+   //Output the number of link of each speed range - display.
+  //linkNoRdd. collect().foreach { println }
+  case class SpeedIntervalRatio(rangeName:String, orderNum:Integer,linkNum:Integer)
+  val speedIntervalRatio = linkNoRdd.map(s => s.split("_")).map(
+    s => SpeedIntervalRatio(
+    s(0),
+    s(1).toInt,
+    s(2).toInt
+    )
+  ).toDF()
+  speedIntervalRatio.registerTempTable("speedIntervalRatio")
+
+
+%sql
+ select rangeName,linkNum
+ from speedIntervalRatio
+ order by orderNum
+ 
+ %md
+<span style="font-size:14px">3. Modeling<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;Build the index value of each link for evaluating congestion.<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;Match the whole road network link, display congestion grade by distinguishing colors.<br></span>
+
+%spark
+/*
+ * III. Modeling
+ */
+  //1. Calculate the congestion hourage of each rtic average per day.
+  val indexRdd = dayhouravgspeedRdd.map{
+    line => val arr = DataProcess.saveOfDay(line).split("_")
+    (arr(0),arr(1))
+  }.groupByKey().map{
+    line => 
+    val it = line._2.iterator
+    val list = new ArrayList[String]()
+    while(it.hasNext) {
+    list.add(it.next())
+    }
+    val arr = UtilClassCompute.DayGetIndex(60,line._1, list).split("_")
+    (arr(0),arr(1))
+  }.reduceByKey((a,b)=>a+","+b).map{
+    line => 
+    val arr = UtilClassCompute.GetAvgValue(line._1, line._2).split("_")
+    val b = arr(0).split(",")
+    (b(0), b(1), arr(1))
+  }
+   //2. Match link and map and display.
+  val broadcastNilink = sc.broadcast(nilinkMap)
+  val linkshowRdd = indexRdd.mapPartitions { 
+    line =>
+    val broadCastNilinkMap = broadcastNilink.value
+    val result = List.newBuilder[(Long, String, Int)]
+    while (line.hasNext) {
+        val data = line.next()
+        val linkID = data._1
+        val link = broadCastNilinkMap.get(lang.Long.parseLong(linkID))
+        val tmp = Mapshow.getMatchLinkIndex(link, linkID, data._3)
+        if (tmp != null) {
+            val index1 = tmp.indexOf(",");
+            val index2 = tmp.lastIndexOf(",");
+            result.+=((lang.Long.parseLong(tmp.substring(0, index1)), tmp.substring(index1 + 1, index2), Integer.parseInt(tmp.substring(index2 + 1))))
+        }
+    }
+    result.result().iterator
+ }.filter { line => line != null }
+
+// print(linkshowRdd.count())
+
+    case class LinkShow(linkID : Long, gpsList : String, status : Int)
+    var aa = linkshowRdd.map(
+        ss => LinkShow(ss._1, ss._2, ss._3)
+    ).toDF()
+    aa.registerTempTable("linkShow")
+    
+    %sql
+select linkID,gpsList,status
+from linkShow
+
+%md
+<span style="font-size:14px">4. Model application<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;Based on the actual track of the user, calculate the index value of each link for providing reference to start autonomous driving.<br></span>
+<span style="font-size:12px;">&nbsp;&nbsp;&nbsp;&nbsp;Match track and road network and display.<br></span>
+
+%spark
+/*
+ * IV. Model application
+ */
+ val linkshowmap = dataLoad.getLinkShowMap(linkshowRdd)
+ val broadcastlinkshow = sc.broadcast(linkshowmap)
+
+ val TrajectoryRdd = BasicTrajectoryRDD.map {
+    line =>
+    val Trajectoryid = line.getRowKey
+    val result = Mapshow.getTrajectoryMessage(broadcastlinkshow.value, line.getLinkSeq)
+    (Trajectoryid, result)
+ }.filter{line => line._2!=null}
+
+ val resultRdd = TrajectoryRdd.flatMap{
+    line=> 
+    val result = List.newBuilder[(Long, String, Int)]
+    val a = Mapshow.getLinkPoint(line._2,  broadcastNilink.value)
+    for(i<- 0 until a.size()){
+    val tmp = a.get(i)
+        if (tmp != null) {
+            val index1 = tmp.indexOf(",");
+            val index2 = tmp.lastIndexOf(",");
+            result.+=((lang.Long.parseLong(tmp.substring(0, index1)), tmp.substring(index1 + 1, index2), Integer.parseInt(tmp.substring(index2 + 1))))
+        }
+    }
+   result.result()
+ }
+//     resultRdd.foreach { line => println(line)} 
+
+ var bb = resultRdd.map(
+    ss => LinkShow(ss._1, ss._2, ss._3)
+ ).toDF()
+ bb.registerTempTable("trajShow")
+ 
+ %sql
+ select linkID,gpsList,status
+ from trajShow
+
+
